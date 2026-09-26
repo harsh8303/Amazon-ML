@@ -1,0 +1,40 @@
+cat > .gitignore <<'EOF'
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.env.*
+
+# Large datasets
+data/
+dataset/
+*.csv
+*.tsv
+*.parquet
+
+# Generated files
+work/
+output/
+
+# Models
+*.pkl
+*.joblib
+*.model
+*.bin
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+EOF
