@@ -19,7 +19,12 @@ import polars as pl
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler, Levenshtein
 
-REC_COLS = ["idx", "nm", "legal", "nsk", "is_dom", "nonlatin", "ad", "nums", "state", "src"]
+from numfeat import number_relation_features
+
+REC_COLS = ["idx", "nm", "legal", "nsk", "is_dom", "nonlatin", "ad", "nums", "state", "src", "country", "comps"]
+# learned, label-free lexicons (per country, so they transfer to France unchanged)
+INJ_RATIO, INJ_MIN = 3.0, 0.002     # name token >= 3x more frequent in S2/S3 than in S1
+FREQ_COMP = 0.005                   # address component in >= 0.5% of the country's S1
 
 
 def _cp(a, b, scorer, dtype=np.float32):
@@ -45,7 +50,51 @@ def token_idf(s1_path, ot_path=None):
     if ot_path:
         out["nm_cnt_ot"] = (pl.scan_parquet(ot_path).group_by("nm")
                               .agg(pl.len().cast(pl.Float32).alias("c")).collect())
+        out["inj"] = injected_tokens(s1, pl.scan_parquet(ot_path))
+    out["freq_comp"] = frequent_components(s1)
     return out
+
+
+def _token_share(lf):
+    n = lf.group_by("country").agg(pl.len().alias("n"))
+    t = (lf.select("country", pl.col("nm").str.split(" ").list.unique().alias("t")).explode("t")
+           .filter(pl.col("t") != "").group_by("country", "t").agg(pl.len().alias("df")))
+    return t.join(n, on="country").select("country", "t", (pl.col("df") / pl.col("n")).alias("share"))
+
+
+def injected_tokens(s1, ot):
+    """Name words the noisy sources add far more often than Source 1 uses them
+    ("holdings", "uptown", "groupe", "participations", "mr", "shri", ...), learnt per
+    country from the unlabeled records of the split."""
+    a, b = _token_share(s1), _token_share(ot)
+    j = b.join(a, on=["country", "t"], how="left", suffix="_s1").with_columns(pl.col("share_s1").fill_null(0.0))
+    return (j.filter((pl.col("share") >= INJ_MIN) & (pl.col("share") >= INJ_RATIO * pl.col("share_s1")))
+             .select("country", "t", pl.lit(True).alias("inj")).collect())
+
+
+def frequent_components(s1):
+    """Whole address components shared by many S1 records of a country: states, regions,
+    departments, big cities. Their spelling variants (Gironde / Nouvelle-Aquitaine,
+    NC / North Carolina) say little about identity."""
+    n = s1.group_by("country").agg(pl.len().alias("n"))
+    c = (s1.select("country", pl.col("comps").str.split("|").list.unique().alias("c")).explode("c")
+           .filter(pl.col("c") != "").group_by("country", "c").agg(pl.len().alias("df")))
+    return (c.join(n, on="country").filter(pl.col("df") >= FREQ_COMP * pl.col("n"))
+             .select("country", "c", pl.lit(True).alias("freq")).collect())
+
+
+def _drop_tokens(p, col, sep, table, key, flag):
+    """Rebuild p[col] (sep-joined) without the tokens flagged in table (country, key);
+    returns (cleaned strings, number of removed tokens)."""
+    L = (p.select("pid", pl.col("country_b").alias("country"), pl.col(col).fill_null("").str.split(sep).alias(key))
+           .explode(key).with_columns(pl.int_range(pl.len()).over("pid").alias("_pos"))
+           .join(table, on=["country", key], how="left", maintain_order="left")
+           .with_columns(pl.col(flag).fill_null(False)))
+    g = (L.sort("pid", "_pos").group_by("pid", maintain_order=True)
+           .agg(pl.col(key).filter(~pl.col(flag) & (pl.col(key) != "")).str.join(" ").alias("s"),
+                pl.col(flag).sum().alias("n")))
+    g = p.select("pid").join(g, on="pid", how="left", maintain_order="left")
+    return g["s"].fill_null("").to_list(), g["n"].fill_null(0).to_numpy().astype(np.float32)
 
 
 def _lookup(p, col, table, key):
@@ -100,8 +149,8 @@ def pair_features(pairs, s1, ot, idf):
     sb_cond = [x.replace(" ", "") for x in kb]
     F["sk_cond_partial"] = _cp(sa_cond, sb_cond, fuzz.partial_ratio)
 
-    tok = p.select(pl.col("nm_a").str.split(" ").list.unique().alias("A"),
-                   pl.col("nm_b").str.split(" ").list.unique().alias("B"),
+    tok = p.select(pl.col("nm_a").str.split(" ").list.unique(maintain_order=True).alias("A"),
+                   pl.col("nm_b").str.split(" ").list.unique(maintain_order=True).alias("B"),
                    pl.col("nsk_a").str.split(" ").list.unique().alias("KA"),
                    pl.col("nsk_b").str.split(" ").list.unique().alias("KB"))
     tok = tok.with_columns(
@@ -159,10 +208,10 @@ def pair_features(pairs, s1, ot, idf):
     F["ad_tset"] = _cp(aa, ab, fuzz.token_set_ratio)
     F["ad_tsort"] = _cp(aa, ab, fuzz.token_sort_ratio)
     F["ad_partial"] = _cp(aa, ab, fuzz.partial_ratio)
-    at = p.select(pl.col("ad_a").str.split(" ").list.unique().alias("A"),
-                  pl.col("ad_b").str.split(" ").list.unique().alias("B"),
-                  pl.col("nums_a").str.split(" ").list.unique().alias("NA"),
-                  pl.col("nums_b").str.split(" ").list.unique().alias("NB"))
+    at = p.select(pl.col("ad_a").str.split(" ").list.unique(maintain_order=True).alias("A"),
+                  pl.col("ad_b").str.split(" ").list.unique(maintain_order=True).alias("B"),
+                  pl.col("nums_a").str.split(" ").list.unique(maintain_order=True).alias("NA"),
+                  pl.col("nums_b").str.split(" ").list.unique(maintain_order=True).alias("NB"))
     at = at.with_columns(
         pl.col("A").list.set_intersection("B").list.len().alias("i"),
         pl.col("A").list.len().alias("la"), pl.col("B").list.len().alias("lb"),
@@ -182,6 +231,7 @@ def pair_features(pairs, s1, ot, idf):
     hna, hnb = at["hna"].to_list(), at["hnb"].to_list()
     F["hn_eq"] = np.array([(-1 if not x or not y else float(x == y)) for x, y in zip(hna, hnb)], np.float32)
     F["hn_lev"] = np.where([bool(x and y) for x, y in zip(hna, hnb)], _cp(hna, hnb, Levenshtein.distance), -1).astype(np.float32)
+    F.update(number_relation_features(p["nums_a"].fill_null("").to_list(), p["nums_b"].fill_null("").to_list()))
     ov_a, ov_b, ov_s = _idf_overlap(p, "ad", idf["ad"], idf["max_idf"])
     F["ad_idf_a"], F["ad_idf_b"], F["ad_idf_sum"] = ov_a, ov_b, ov_s
     st = p.select(pl.col("state_a").fill_null(""), pl.col("state_b").fill_null(""))
@@ -192,6 +242,19 @@ def pair_features(pairs, s1, ot, idf):
     F["ad_eq"] = ((p["ad_a"] == p["ad_b"]) & (p["ad_b"] != "")).fill_null(False).to_numpy().astype(np.float32)
 
     # ---- combined
+    # ---- learned lexicons: names without injected words, addresses without frequent parts
+    if "inj" in idf:
+        ca_, _ = _drop_tokens(p, "nm_a", " ", idf["inj"], "t", "inj")
+        cb_, nb_inj = _drop_tokens(p, "nm_b", " ", idf["inj"], "t", "inj")
+        F["nm_inj_b"] = nb_inj
+        F["nm_clean_tset"] = _cp(ca_, cb_, fuzz.token_set_ratio)
+        F["nm_clean_tsort"] = _cp(ca_, cb_, fuzz.token_sort_ratio)
+    ra_, _ = _drop_tokens(p, "comps_a", "|", idf["freq_comp"], "c", "freq")
+    rb_, _ = _drop_tokens(p, "comps_b", "|", idf["freq_comp"], "c", "freq")
+    F["adcore_tset"] = np.where([bool(x and y) for x, y in zip(ra_, rb_)], _cp(ra_, rb_, fuzz.token_set_ratio), -1).astype(np.float32)
+    F["adcore_tsort"] = np.where([bool(x and y) for x, y in zip(ra_, rb_)], _cp(ra_, rb_, fuzz.token_sort_ratio), -1).astype(np.float32)
+    F["adcore_len_a"] = np.array([len(x) for x in ra_], np.float32)
+
     F["nm_ad_min"] = np.minimum(F["nm_tset"], F["ad_tset"])
     F["sk_ad_prod"] = F["sk_tset"] * F["ad_tset"] / 100.0
 

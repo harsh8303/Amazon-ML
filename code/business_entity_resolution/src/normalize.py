@@ -83,7 +83,7 @@ US_STATES = {
 }
 IN_STATES = {
     "andhra pradesh": "ap", "arunachal pradesh": "ar", "assam": "as", "bihar": "br",
-    "chhattisgarh": "cg", "chattisgarh": "cg", "goa": "ga", "gujarat": "gj", "haryana": "hr",
+    "chhattisgarh": "cg", "chattisgarh": "cg", "goa": "ga", "gujarat": "gj", "haryana": "hr", "keralam": "kl",
     "himachal pradesh": "hp", "jharkhand": "jh", "karnataka": "ka", "kerala": "kl",
     "madhya pradesh": "mp", "maharashtra": "mh", "manipur": "mn", "meghalaya": "ml",
     "mizoram": "mz", "nagaland": "nl", "odisha": "od", "orissa": "od", "punjab": "pb",
@@ -117,11 +117,37 @@ def _state_key(s):
     return "".join(skeleton(t) for t in s.split())
 
 
+def _lev1(a, b):
+    """True if a and b are at most one edit apart."""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    s, l = (a, b) if len(a) < len(b) else (b, a)
+    return any(l[:i] + l[i + 1:] == s for i in range(len(l)))
+
+
+@lru_cache(maxsize=200_000)
+def legal_skel(sk):
+    """Romanised Indic legal word -> legal code. Exact skeleton, or one edit away from a
+    skeleton of >= 3 letters (romanisation noise: praaibhett -> prbt, limirrrrdd -> lmrd)."""
+    if sk in LEGAL_SKEL:
+        return LEGAL_SKEL[sk]
+    if len(sk) >= 3:
+        for k, v in LEGAL_SKEL.items():
+            if len(k) >= 3 and _lev1(sk, k):
+                return v
+    return None
+
+
 STATE_SKEL = {}
 for _d in (US_STATES, IN_STATES):
     for _full, _code in _d.items():
         STATE_SKEL[_state_key(_full)] = _code
 STATE_CODES = set(US_STATES.values()) | set(IN_STATES.values())
+STATE_NAMES = set(US_STATES) | set(IN_STATES)
 
 _NONASCII = re.compile(r"[^\x00-\x7f]")
 _LATIN_EXT = re.compile(r"[À-ɏ]")
@@ -166,8 +192,8 @@ def norm_name(raw: str):
             continue
         if t in LEGAL:
             legal.append(LEGAL[t])
-        elif nonlatin and skeleton(t) in LEGAL_SKEL:
-            legal.append(LEGAL_SKEL[skeleton(t)])
+        elif nonlatin and legal_skel(skeleton(t)):
+            legal.append(legal_skel(skeleton(t)))
         else:
             core.append(t)
     # dedupe while keeping order (noise often repeats tokens: "Inc Inc", "Group Group")
@@ -182,17 +208,21 @@ def norm_address(raw: str):
     s = to_ascii(raw)
     s = s.replace("&", " and ").replace("'", "")
     comps_out, toks, state = [], [], ""
-    for comp in s.split(","):
+    raw_comps = raw.split(",")
+    for ci, comp in enumerate(s.split(",")):
         c = _DOTTED.sub("", comp).replace(".", " ")
         c = _PUNCT.sub(" ", c)
         ct = [t for t in c.split() if t not in NULL_TOKENS]
         if not ct:
             continue
         key = "".join(skeleton(t) for t in ct if not t.isdigit())
-        if key in STATE_SKEL:
+        # skeleton keys are short and collide with foreign places ("rue jeannine" -> rjn =
+        # arizona, "iut" -> t = utah): use them only for non-Latin components or long keys
+        comp_nonlatin = ci < len(raw_comps) and bool(_NON_LATIN.search(raw_comps[ci]))
+        if key in STATE_SKEL and (comp_nonlatin or len(key) >= 5 or " ".join(ct) in STATE_NAMES):
             state = STATE_SKEL[key]
             continue
-        if len(ct) == 1 and ct[0] in STATE_CODES and len(comps_out) > 0:
+        if len(ct) == 1 and ct[0] in STATE_CODES and (len(comps_out) > 0 or len(raw_comps) > 2):
             state = ct[0]
             continue
         ct = [(t.lstrip("0") or "0") if t.isdigit() else ADDR.get(t, t) for t in ct]

@@ -48,13 +48,20 @@ def feat_parts(split):
     return sorted(glob.glob(os.path.join(WORK_DIR, f"{split}_feat", "*.parquet")))
 
 
+# share of S1 entities used to fit the matchers: 1/SUB_MOD (was 1/4). Raise it again if
+# stage-1 training runs out of memory.
+SUB_MOD = int(os.environ.get("BER_SUB_MOD", "2"))
+# comma-separated feature names to leave out (ablations, e.g. BER_DROP_FEATS=state_rel)
+DROP_FEATS = set(filter(None, os.environ.get("BER_DROP_FEATS", "").split(",")))
+
+
 def stage1_cols(split):
     cols = pl.read_parquet_schema(feat_parts(split)[0])
-    return [c for c in cols if c not in ("s1_idx", "ot_idx")]
+    return [c for c in cols if c not in ("s1_idx", "ot_idx") and c not in DROP_FEATS]
 
 
 # ------------------------------------------------------------------ model fitting helpers
-def load_train_rows(extra=None, sub_mod=4):
+def load_train_rows(extra=None, sub_mod=SUB_MOD):
     """Rows of the train feature parts whose S1 entity is in the training subsample."""
     lf = pl.scan_parquet(feat_parts("train")).filter((pl.col("s1_idx") // 2) % sub_mod == 0)
     df = lf.collect()
@@ -63,7 +70,7 @@ def load_train_rows(extra=None, sub_mod=4):
     return df.with_columns(pl.col(pl.Float64).cast(pl.Float32))
 
 
-def fit_two_folds(df, cols, gt, label, sub_mod=4):
+def fit_two_folds(df, cols, gt, label, sub_mod=SUB_MOD):
     df = df.join(gt.with_columns(pl.lit(1, pl.UInt8).alias("y")), on=["s1_idx", "ot_idx"], how="left") \
            .with_columns(pl.col("y").fill_null(0))
     fold = (df["s1_idx"] % 2).to_numpy()
@@ -72,7 +79,9 @@ def fit_two_folds(df, cols, gt, label, sub_mod=4):
     y = df["y"].to_numpy()
     models = []
     for f in (0, 1):
-        tr, es = (fold == f), (fold != f) & (grp == 0)
+        # early stopping on held-out entities of the *training* fold: the other fold is
+        # scored out-of-fold and must not influence the model
+        tr, es = (fold == f) & (grp != 0), (fold == f) & (grp == 0)
         t = time.time()
         m = lgb.LGBMClassifier(**LGB_PARAMS)
         m.fit(X[tr], y[tr], eval_set=[(X[es], y[es])], callbacks=[lgb.early_stopping(100, verbose=False)])

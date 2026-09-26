@@ -65,7 +65,28 @@ Source-2/3 records and prints the recall@k diagnostics. It's useful for tuning.
 | `model.py` | LightGBM settings, stage-2 context and sibling features |
 | `decision.py` | one-to-one constraint and expected-F0.5-optimal match sets |
 | `common.py` | ground-truth loading and the exact competition metric (macro F0.5) |
+| `numfeat.py` | house-number relation features (typo vs same-street decoy) |
 | `run_pipeline.py` | end-to-end driver (`train` / `test`) |
+| `make_dropout_split.py` | test-like validation split: drops 19% of train S1 entities, keeps all S2/S3 |
+| `eval_existing.py` | scores a split with already-trained models (no retraining) |
+| `block_diag.py` | blocking-miss diagnostics on the `run_blocking.py train 20` sample |
+
+## Environment variables
+
+| variable | default | meaning |
+|---|---|---|
+| `BER_SUB_MOD` | 2 | stage-1/2 models are fitted on 1/`BER_SUB_MOD` of S1 entities (use 4 if RAM is short) |
+| `BER_DROP_FEATS` | (none) | comma-separated features to leave out, for ablations (e.g. `state_rel`) |
+
+## Test-like validation
+
+The test split has more distractors per S1 entity than train (5.75 vs 4.68 S2/S3 records
+per entity). To measure the score under test-like conditions:
+
+```bash
+python make_dropout_split.py 0.19                      # writes ../../../work_drop19
+BER_WORK=../../../work_drop19 python eval_existing.py  # current models, no retraining
+```
 
 ## Notebook
 

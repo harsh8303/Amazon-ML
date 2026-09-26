@@ -15,7 +15,7 @@ import numpy as np
 import polars as pl
 
 from common import norm_path
-from config import WORK_DIR
+from config import SEED, WORK_DIR
 from features import REC_COLS, pair_features, token_idf
 
 BLOCK_FEATS = (["sc_comb", "sc_name", "sc_addr", "sc_mix", "n_ot", "margin_ot"]
@@ -65,34 +65,54 @@ def add_labels(f, gt):
 
 
 def train_prefilter(gt, sample_mod=10, target_recall_loss=0.002):
-    """Train stage-0 on a 1/sample_mod subset of S2/S3 records of the train split."""
+    """Train stage-0 on a 1/sample_mod subset of S2/S3 records of the train split.
+    Cross-fitted like the matchers (fold = s1_idx % 2): p0 is the strongest stage-1
+    feature, so on train it must be out-of-fold. Returns ([model_fold0, model_fold1], thr);
+    the threshold is set on the pooled out-of-fold scores."""
     parts = sorted(glob.glob(os.path.join(cand_dir("train"), "*.parquet")))
     f = (pl.scan_parquet(parts).filter(pl.col("ot_idx") % sample_mod == 0).collect())
     f = add_labels(f, gt)
     X, y = f.select(BLOCK_FEATS).to_numpy().astype(np.float32), f["y"].to_numpy()
-    rng = np.random.default_rng(0)
-    va = (f["ot_idx"].to_numpy() // sample_mod) % 5 == 0
-    m = lgb.LGBMClassifier(n_estimators=400, learning_rate=0.08, num_leaves=63, min_child_samples=100,
-                           subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
-    m.fit(X[~va], y[~va], eval_set=[(X[va], y[va])], callbacks=[lgb.early_stopping(30, verbose=False)])
-    p = m.predict_proba(X[va])[:, 1]
-    pos = np.sort(p[y[va] == 1])
+    fold = (f["s1_idx"].to_numpy() % 2)
+    es = (f["ot_idx"].to_numpy() // sample_mod) % 5 == 0
+    oof = np.zeros(len(y), np.float32)
+    models = []
+    for k in (0, 1):
+        tr = fold == k
+        m = lgb.LGBMClassifier(n_estimators=400, learning_rate=0.08, num_leaves=63, min_child_samples=100,
+                               subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1,
+                               random_state=SEED, deterministic=True, force_row_wise=True)
+        m.fit(X[tr & ~es], y[tr & ~es], eval_set=[(X[tr & es], y[tr & es])],
+              callbacks=[lgb.early_stopping(30, verbose=False)])
+        oof[~tr] = m.predict_proba(X[~tr])[:, 1]
+        models.append(m)
+    pos = np.sort(oof[y == 1])
     thr = float(pos[int(target_recall_loss * len(pos))])  # lose at most target share of positives
-    keep = p >= thr
-    ceiling = y[va].sum() / max(1, gt.filter(pl.col("ot_idx") % sample_mod == 0).height)
-    print(f"prefilter: val AUC-ish pos={y[va].sum():,} thr={thr:.4f} keep={keep.mean():.3f} of pairs, "
-          f"recall kept={(p[y[va] == 1] >= thr).mean():.4f}, blocking recall(sample)={ceiling:.4f}")
-    del rng
-    return m, thr
+    ceiling = y.sum() / max(1, gt.filter(pl.col("ot_idx") % sample_mod == 0).height)
+    print(f"prefilter (OOF): pos={y.sum():,} thr={thr:.4f} keep={(oof >= thr).mean():.3f} of pairs, "
+          f"recall kept={(oof[y == 1] >= thr).mean():.4f}, blocking recall(sample)={ceiling:.4f}")
+    return models, thr
 
 
 def apply_prefilter(split, model, thr):
+    """Train: each pair scored by the fold model that did not see its S1 entity.
+    Test: mean of the fold models."""
+    models = model if isinstance(model, (list, tuple)) else [model]
     parts = sorted(glob.glob(os.path.join(cand_dir(split), "*.parquet")))
     out = []
     for p in parts:
         f = pl.read_parquet(p)
-        f = f.with_columns(pl.Series("p0", model.predict_proba(f.select(BLOCK_FEATS).to_numpy()
-                                                                .astype(np.float32))[:, 1].astype(np.float32)))
+        X = f.select(BLOCK_FEATS).to_numpy().astype(np.float32)
+        if split == "train" and len(models) == 2:
+            fold = f["s1_idx"].to_numpy() % 2
+            p0 = np.zeros(len(f), np.float32)
+            for k in (0, 1):
+                m = fold == k
+                if m.any():
+                    p0[m] = models[1 - k].predict_proba(X[m])[:, 1]
+        else:
+            p0 = np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0)
+        f = f.with_columns(pl.Series("p0", p0.astype(np.float32)))
         out.append(f.filter(pl.col("p0") >= thr))
     out = pl.concat(out).sort("ot_idx")
     out.write_parquet(os.path.join(WORK_DIR, f"{split}_pf.parquet"))

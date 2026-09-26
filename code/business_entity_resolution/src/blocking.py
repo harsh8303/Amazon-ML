@@ -42,6 +42,9 @@ GROUPS = {"name": {"n": 1.0, "k": 0.5, "p": 1.5, "q": 0.8, "r": 0.8, "t": 0.5},
 DF_CAP = {"n": 100, "k": 100, "p": 300, "q": 300, "r": 300, "t": 300,
           "a": 100, "d": 100, "b": 300, "s": 300, "x": 300, "y": 300}
 K = {"comb": 8, "name": 3, "addr": 3, "mix": 2}
+# records the default ranking serves worst (no address, non-Latin name) get a deeper
+# combined list: on the 1/20 train sample their recall is 0.75-0.87 at top-8
+K_HARD = 32
 
 
 def _pair_keys(df, col):
@@ -128,7 +131,9 @@ class Blocker:
                 pl.col("df1").fill_null(0))
             C = {g: (self._mat(L, n, cw, False) @ self.AT[g]).tocsr() for g, cw in GROUPS.items()}
             Cc = ((C["name"] + C["addr"] + C["mix"]) * (1 / 3)).tocsr()
-            sel = [_topk(Cc, K["comb"])] + [_topk(C[g], K[g]) for g in GROUPS]
+            hard = ((part["ad"] == "") | part["nonlatin"]).to_numpy()
+            k_comb = np.where(hard, K_HARD, K["comb"])
+            sel = [_topk(Cc, k_comb)] + [_topk(C[g], K[g]) for g in GROUPS]
             r = np.concatenate([x[0] for x in sel]).astype(np.int64)
             c = np.concatenate([x[1] for x in sel]).astype(np.int64)
             if len(r) == 0:
@@ -158,13 +163,14 @@ def ot_context(f):
 
 
 def _topk(C, k):
+    """k: int, or an array with one k per row of C."""
     if C.nnz == 0:
         return np.array([], np.int64), np.array([], np.int64)
     rid = np.repeat(np.arange(C.shape[0], dtype=np.int32), np.diff(C.indptr))
     order = np.lexsort((-C.data, rid))
     rid_o = rid[order]
     rank = np.arange(len(order)) - C.indptr[rid_o]
-    keep = rank < k
+    keep = rank < (k[rid_o] if isinstance(k, np.ndarray) else k)
     return rid_o[keep], C.indices[order][keep]
 
 
@@ -186,7 +192,7 @@ def block_split(s1_path, ot_path, out_dir, df_cap=None, verbose=True, sample=Non
         ot = ot_all.filter(pl.col("country") == c)
         if sample:  # deterministic 1/sample subset of S2/S3 for fast development
             ot = ot.filter(pl.col("idx") % sample == 0)
-        ot = ot.select("idx", "nm", "nsk", "ad", "nums").collect()
+        ot = ot.select("idx", "nm", "nsk", "ad", "nums", "nonlatin").collect()
         if s1.height == 0 or ot.height == 0:
             continue
         bl = Blocker(s1, df_cap)

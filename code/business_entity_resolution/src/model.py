@@ -13,10 +13,12 @@ import polars as pl
 from rapidfuzz import fuzz, process
 
 from common import norm_path
+from config import SEED
 
 LGB_PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_child_samples=200,
                   subsample=0.8, subsample_freq=1, colsample_bytree=0.7, reg_lambda=1.0,
-                  n_estimators=3000, verbose=-1, n_jobs=os.cpu_count())
+                  n_estimators=4000, verbose=-1, n_jobs=os.cpu_count(),
+                  random_state=SEED, deterministic=True, force_row_wise=True)
 
 
 def importance(models, cols, top=40):
